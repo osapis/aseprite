@@ -1,0 +1,109 @@
+name: Build macOS app
+
+on:
+  push:
+    branches: [ci/macos-build]
+
+jobs:
+  macos:
+    name: Build Aseprite for Apple Silicon
+    if: github.repository == 'osapis/aseprite'
+    runs-on: macos-15
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Verify submodules and install Skia
+        shell: bash
+        run: |
+          submodules=$(git submodule status --recursive)
+          printf '%s\n' "$submodules"
+          if grep -Eq '^[+-U]' <<< "$submodules"; then
+            echo '::error::A submodule is missing or differs from the pinned commit.'
+            exit 1
+          fi
+
+          # A fork may not have the upstream tag used by git describe.
+          git fetch --no-tags --no-recurse-submodules \
+            https://github.com/aseprite/aseprite.git tag v1.3.18.6
+
+          skia_url=$(bash laf/misc/skia-url.sh release macos arm64)
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$RUNNER_TEMP/skia.zip" "$skia_url"
+          unzip -q "$RUNNER_TEMP/skia.zip" -d "$RUNNER_TEMP/skia"
+
+      - name: Compile the full GUI application
+        shell: bash
+        run: |
+          skia="$RUNNER_TEMP/skia"
+          skia_lib="$skia/out/Release-arm64"
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            -DPNG_ARM_NEON:STRING=on \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR="$skia" \
+            -DSKIA_LIBRARY_DIR="$skia_lib" \
+            -DSKIA_LIBRARY="$skia_lib/libskia.a" \
+            -DENABLE_TRIAL_MODE=OFF \
+            -DENABLE_SCRIPTING=ON
+          cmake --build build --target aseprite --parallel "$(sysctl -n hw.ncpu)"
+
+      - name: Verify the app and create the disk image
+        id: package
+        shell: bash
+        run: |
+          staging="$RUNNER_TEMP/aseprite-dmg"
+          mkdir -p "$staging"
+          app="$staging/Aseprite.app"
+          ditto build/bin/Aseprite.app "$app"
+          ln -s /Applications "$staging/Applications"
+
+          resources="$app/Contents/Resources"
+          test -f "$resources/data/gui.xml"
+          test -f "$resources/data/EULA.txt"
+          sips -s format icns "$resources/data/icons/ase256.png" --out "$resources/Aseprite.icns"
+          sips -s format icns "$resources/data/icons/doc256.png" --out "$resources/Document.icns"
+          sips -s format icns "$resources/data/icons/ext256.png" --out "$resources/Extension.icns"
+          codesign --force --sign - "$app"
+          codesign --verify --strict "$app"
+
+          binary="$app/Contents/MacOS/aseprite"
+          lipo -verify_arch arm64 "$binary"
+          export ASEPRITE_USER_FOLDER="$RUNNER_TEMP/aseprite-smoke-settings"
+          mkdir -p "$ASEPRITE_USER_FOLDER"
+          "$binary" --batch tests/sprites/abcd.aseprite \
+            --save-as "$RUNNER_TEMP/round-trip.aseprite" \
+            --save-as "$RUNNER_TEMP/export.png"
+          test -s "$RUNNER_TEMP/round-trip.aseprite"
+          test -s "$RUNNER_TEMP/export.png"
+
+          version=$("$binary" --version)
+          version=${version#Aseprite }
+          [[ "$version" =~ ^1\.[[:alnum:].+-]+$ ]]
+          dmg="$RUNNER_TEMP/Aseprite-$version-macOS-arm64.dmg"
+          hdiutil create -format UDZO -srcfolder "$staging" -volname Aseprite "$dmg"
+          hdiutil verify "$dmg"
+          printf 'path=%s\nversion=%s\n' "$dmg" "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to a draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DMG_PATH: ${{ steps.package.outputs.path }}
+          ASEPRITE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          tag="aseprite-macos-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          release_url=$(gh release create "$tag" "$DMG_PATH" --draft \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Aseprite $ASEPRITE_VERSION for macOS (Apple Silicon)" \
+            --notes "Personal build from commit $GITHUB_SHA. Keep this release as a draft.")
+          printf 'Download the macOS package from the [draft release](%s).\n' "$release_url" >> "$GITHUB_STEP_SUMMARY"
