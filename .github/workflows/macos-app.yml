@@ -77,7 +77,7 @@ jobs:
           codesign --verify --strict "$app"
 
           binary="$app/Contents/MacOS/aseprite"
-          lipo -verify_arch arm64 "$binary"
+          lipo "$binary" -verify_arch arm64
           export ASEPRITE_USER_FOLDER="$RUNNER_TEMP/aseprite-smoke-settings"
           mkdir -p "$ASEPRITE_USER_FOLDER"
           "$binary" --batch tests/sprites/abcd.aseprite \
